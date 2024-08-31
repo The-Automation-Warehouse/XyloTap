@@ -1,36 +1,49 @@
+
 #include <Arduino.h>
 #include <Adafruit_MCP23X08.h>
 #include <Adafruit_MCP23X17.h>
 
-#define SOLENOID_PIN 10
+#define BUTTON_PIN 3   // MCP23XXX pin used for interrupt
+
+#define INT_PIN 3      // microcontroller pin attached to INTA/B
 
 Adafruit_MCP23X17 mcp;
 
-
 void setup() {
   Serial.begin(115200);
-  pinMode(SOLENOID_PIN, OUTPUT);
+  //while (!Serial);
+  Serial.println("MCP23xxx Interrupt Test!");
 
-   if (!mcp.begin_I2C()) {
-    Serial.println("MCP23X17 not found");
+  // uncomment appropriate mcp.begin
+  if (!mcp.begin_I2C()) {
+  //if (!mcp.begin_SPI(CS_PIN)) {
+    Serial.println("Error.");
     while (1);
   }
 
-  // Set all mcp pins to input_pullup
-  for (uint8_t i = 0; i < 16; i++) {
-    mcp.pinMode(i, INPUT);
-    mcp.pinMode(i, INPUT_PULLUP);
-  }
+  mcp.clearInterrupts();
+  
+  // configure MCU pin that will read INTA/B state
+  pinMode(INT_PIN, INPUT_PULLUP);
+
+  mcp.setupInterrupts(true, true, LOW);
+
+  // configure button pin for input with pull up
+  mcp.pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // enable interrupt on button_pin
+  mcp.setupInterruptPin(BUTTON_PIN, LOW);
+  mcp.clearInterrupts();
+
+  Serial.println("Looping...");
 }
 
 void loop() {
-
-  // Read all mcp pins
-  for (uint8_t i = 0; i < 16; i++) {
-    Serial.print(mcp.digitalRead(i));
+  if (!digitalRead(INT_PIN)) {
+    Serial.print("Interrupt detected on pin: ");
+    Serial.println(mcp.getLastInterruptPin());
+    Serial.print("Pin states at time of interrupt: 0b");
+    Serial.println(mcp.getCapturedInterrupt(), 2);
 
   }
-Serial.println();
-delay(100);
 }
-
