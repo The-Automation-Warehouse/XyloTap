@@ -1,50 +1,86 @@
-
 #include <Arduino.h>
 #include <Adafruit_MCP23X08.h>
 #include <Adafruit_MCP23X17.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <IntervalTimer.h>
+#include <MD_MIDIFile.h>
+#include "helperFunctions.h"
+#include <iostream>
 
 // The keys are CDEFGAHCDEFGAHCD
 
 
 const uint8_t solenoids[16] = {0, 2, 4, 6, 1, 3, 5, 7, 28, 25, 24, 12, 11, 10, 9, 8};
-unsigned long solenoidOnDurations[16] = {16, 16, 16, 18, 16, 14, 16, 16, 13, 14, 14, 15, 16, 16, 16, 16};
+unsigned long solenoidOnDurations[16] = {18, 18, 18, 19, 16, 16, 16, 15, 15, 15, 17, 16, 16, 16, 16, 16};
 unsigned long solenoidOnTimes[16];
 bool solenoidStates[16];
 const uint8_t leds[16] = {41, 40, 39, 38, 37, 36, 35, 34, 32, 31, 30, 27, 26, 23, 22, 33};
 
-void strikeKey(int key);
-void turnOffKey(int key);
-void checkSolenoids();
+extern void strikeKey(int key);
+extern void turnOffKey(int key);
+extern void checkSolenoids();
 
 IntervalTimer solenoidTimer;
 
 #define YellowLED 15
 #define BlueLED 14
 
-#define UP_BUTTON 20
-#define DOWN_BUTTON 21
+#define UP_BUTTON 21
+#define DOWN_BUTTON 20
 #define CONFIRM_BUTTON 29
 
 // LCD
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+int menuIndex = 0;
+bool refreshMenu = true;
+String songList[32];
 
-// SD
-File root;
-void printDirectory(File dir, int numTabs);
+// SDFat
 
+// SDCARD_SS_PIN is defined for the built-in SD on some boards.
+#ifndef SDCARD_SS_PIN
+const uint8_t SD_CS_PIN = SS;
+#else  // SDCARD_SS_PIN
+// Assume built-in SD is used.
+const uint8_t SD_CS_PIN = SDCARD_SS_PIN;
+#endif  // SDCARD_SS_PIN
+
+// Try max SPI clock for an SD. Reduce SPI_CLOCK if errors occur.
+#define SPI_CLOCK SD_SCK_MHZ(50)
+
+// Try to select the best SD card configuration.
+#if HAS_SDIO_CLASS
+#define SD_CONFIG SdioConfig(FIFO_SDIO)
+#elif  ENABLE_DEDICATED_SPI
+#define SD_CONFIG SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SPI_CLOCK)
+#else  // HAS_SDIO_CLASS
+#define SD_CONFIG SdSpiConfig(SD_CS_PIN, SHARED_SPI, SPI_CLOCK)
+#endif  // HAS_SDIO_CLASS
+SdFat SD;
+MD_MIDIFile SMF;
+
+extern void midiCallback(midi_event *pev);
+extern int midiNoteToKey(int midiNote);
+extern void testPattern();
+void playSong(String name);
+void stopSong();
 
 // MCP23017
 #define INTA_PIN 16
 #define INTB_PIN 17
 Adafruit_MCP23X17 mcp;
-void handleMCP();
+extern void handleMCP();
+
+
+void resetTeensy() {digitalWrite(BlueLED, LOW);  SCB_AIRCR = 0x05FA0004;}
 
 void setup() {
+
+  Serial.begin(115200);
+  Serial.println("Initializing...");
 
   pinMode(CONFIRM_BUTTON, INPUT_PULLUP);
   pinMode(UP_BUTTON, INPUT_PULLUP);
@@ -55,20 +91,30 @@ void setup() {
   digitalWrite(YellowLED, HIGH);
   digitalWrite(BlueLED, LOW);
 
-  Serial.begin(115200);
-
   for (uint8_t i = 0; i < 16; i++) {
+    digitalWrite(BlueLED, HIGH);
     pinMode(solenoids[i], OUTPUT);
     digitalWrite(solenoids[i], LOW);
     solenoidOnTimes[i] = 0;
     solenoidStates[i] = false;
+    delay(50);
+    digitalWrite(BlueLED, LOW);
+    delay(50);
   }
   for (uint8_t i = 0; i < 16; i++) {
+    digitalWrite(BlueLED, HIGH);
     pinMode(leds[i], OUTPUT);
     digitalWrite(leds[i], HIGH);
+    delay(50);
+    digitalWrite(BlueLED, LOW);
+    delay(50);
   }
 
-  solenoidTimer.begin(checkSolenoids, 200);
+  Serial.println("Solenoids ready.");
+
+  solenoidTimer.begin(checkSolenoids, 500);
+
+  Serial.println("Timer running.");
 
 
   // LCD
@@ -77,39 +123,52 @@ void setup() {
   lcd.setCursor(0, 0);
   lcd.print("Initializing...");
   delay(300);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("SD Card: ");
 
   // SD
-  if (!SD.begin(BUILTIN_SDCARD)) {
-    lcd.print("Error");
+  if (!SD.begin(SD_CONFIG)) {
+    Serial.println("SD Error.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SD Error.");
+    while (1) {
+      if (digitalRead(CONFIRM_BUTTON) == LOW) {
+        resetTeensy();
+      }
+    }
   } else {
-    lcd.print("OK");
+    Serial.println("SD Card OK.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SD Card OK.");
   }
 
-  Serial.println("initialization done.");
-
-  root = SD.open("/");
-
-  printDirectory(root, 0);
 
   // MCP23017
   if (!mcp.begin_I2C()) {
     Serial.println("MCP Error.");
+    while (1) {
+      if (digitalRead(CONFIRM_BUTTON) == LOW) {
+        resetTeensy();
+      }
+    }
+  } else {
+    Serial.println("MCP Initialized.");
   }
 
-  pinMode(INTA_PIN, INPUT);
-  pinMode(INTB_PIN, INPUT);
-  pinMode(7, OUTPUT);
+  pinMode(INTA_PIN, INPUT_PULLUP);
+  pinMode(INTB_PIN, INPUT_PULLUP);
 
   attachInterrupt(digitalPinToInterrupt(INTA_PIN), handleMCP, FALLING);
   attachInterrupt(digitalPinToInterrupt(INTB_PIN), handleMCP, FALLING);
+
+  Serial.println("MCP Interrupts attached.");
 
   mcp.clearInterrupts();
   for (uint8_t i = 0; i < 16; i++) {
     mcp.disableInterruptPin(i);
   }
+
+  Serial.println("MCP Interrupts disabled.");
 
   for (uint8_t i = 0; i < 16; i++) {
     mcp.pinMode(i, INPUT_PULLUP);
@@ -121,6 +180,18 @@ void setup() {
     mcp.setupInterruptPin(i, CHANGE);
   }
 
+  Serial.println("MCP Interrupts enabled.");
+
+  // MIDI
+  SMF.begin(&SD);
+  SMF.setMidiHandler(midiCallback);
+  SMF.looping(false);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("XyloTap ready!");
+  delay(500);
+
   Serial.println("Looping...");
 
   digitalWrite(BlueLED, HIGH);
@@ -128,144 +199,147 @@ void setup() {
 
 void loop() {
 
-  // Test pattern
+  // Show a menu consisting of the list of songs from the SD card
+  // The user can scroll through the list using the UP and DOWN buttons
+  // The user can select a song using the CONFIRM button
 
-  if (digitalRead(CONFIRM_BUTTON) == LOW) {
-    // Blink solenoids and leds
-    for (uint8_t i = 0; i < 16; i++) {
-      strikeKey(i);
+  // If a song is selected, play the song
+  // If the song is playing, the user can stop the song by clicking the CONFIRM button
+
+  Serial.println("Test pattern.");
+  testPattern();
+
+  Serial.println("Menu loop.");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Select a song:");
+  lcd.setCursor(0, 1);
+  // Load the songs from the SD card to the songList array
+  FsFile dir = SD.open("/");
+  int songCount = 0;
+  while (true) {
+    SdFile entry;
+    if (!entry.openNext(&dir, O_RDONLY)) {
+        break;
+    }
+    if (!entry) {
+      break;
+    }
+    if (entry.isDirectory()) {
+      continue;
+    }
+    char name[32];
+    entry.getName(name, 32);
+    songList[songCount] = String(name);
+    songCount++;
+    entry.close();
+  }
+
+  // Print the song list to the serial monitor
+  for (int i = 0; i < songCount; i++) {
+    Serial.println(songList[i]);
+  }
+
+  while (true) {
+    if (digitalRead(UP_BUTTON) == LOW) {
+      menuIndex--;
+      if (menuIndex < 0) {
+        menuIndex = songCount - 1;
+      }
+      refreshMenu = true;
+    }
+    if (digitalRead(DOWN_BUTTON) == LOW) {
+      menuIndex++;
+      if (menuIndex >= songCount) {
+        menuIndex = 0;
+      }
+      refreshMenu = true;
+    }
+    if (digitalRead(CONFIRM_BUTTON) == LOW) {
+      playSong(songList[menuIndex]);
+      break;
+    }
+    if (refreshMenu) {
+      lcd.setCursor(0, 1);
+      // Clear the line before printing the song name
+      lcd.print("                ");
+      lcd.setCursor(0, 1);
+      // Remove the .mid or .MID extension from the song name
+      String songName = songList[menuIndex];
+      songName.replace(".mid", "");
+      songName.replace(".MID", "");
+      lcd.print(songName);
+      refreshMenu = false;
+      Serial.println("Menu refreshed.");
       delay(300);
     }
   }
 
-  // Play pattern
-
-  if (digitalRead(DOWN_BUTTON) == LOW) {
-    for (uint8_t i = 0; i < 2; i++) {
-      strikeKey(0);
-      delay(200);
-      strikeKey(2);
-      delay(100);
-      strikeKey(4);
-      delay(100);
-      strikeKey(5);
-      delay(200);
-      strikeKey(7);
-      delay(100);
-      strikeKey(9);
-      delay(100);
-      strikeKey(7);
-      delay(200);
-    }
-    strikeKey(1);
-    delay(400);
-    strikeKey(3);
-    delay(200);
-    strikeKey(14);
-    delay(400);
-    strikeKey(15);
-    delay(400);
-    strikeKey(16);
-    delay(200);
-    strikeKey(10);
-    delay(100);
-    strikeKey(4);
-    delay(100);
-    strikeKey(6);
-    delay(200);
-
-    for (uint8_t i = 0; i < 2; i++) {
-      strikeKey(0);
-      delay(200);
-      strikeKey(2);
-      delay(100);
-      strikeKey(4);
-      delay(100);
-      strikeKey(5);
-      delay(200);
-      strikeKey(7);
-      delay(100);
-      strikeKey(9);
-      delay(100);
-      strikeKey(7);
-      delay(200);
-    }
-  }
-
-}
-
-void handleMCP() {
-  int pin = mcp.getLastInterruptPin();
-  if (pin == 255) {
-    return;
-  }
-
-  // If button 14 is pressed, toggle pin 7 and build in LED on Teensy 4.1
-  if (pin == 14) {
-    digitalWrite(7, !digitalRead(7));
-    digitalWrite(LED_BUILTIN, digitalRead(7));
-  }
-  Serial.print("Interrupt detected on pin: ");
-  Serial.println(mcp.getLastInterruptPin());
-  mcp.clearInterrupts();  // clear
-
 
 }
 
 
-void printDirectory(File dir, int numTabs) {
-  while (true) {
 
-    File entry =  dir.openNextFile();
-    if (! entry) {
-      // no more files
-      break;
-    }
-    for (uint8_t i = 0; i < numTabs; i++) {
-      Serial.print('\t');
-    }
-    Serial.print(entry.name());
-    if (entry.isDirectory()) {
-      Serial.println("/");
-      printDirectory(entry, numTabs + 1);
+
+
+
+
+
+
+void playSong(String name) {
+  SMF.setFilename(name.c_str());
+    int err = SMF.load(name.c_str());
+    if (err != 0) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Error loading file.");
+      Serial.println("Error loading file.");
     } else {
-      // files have sizes, directories do not
-      Serial.print("\t\t");
-      Serial.println(entry.size(), DEC);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Now playing: ");
+      lcd.setCursor(0, 1);
+      String songName = SMF.getFilename();
+      songName.replace(".mid", "");
+      songName.replace(".MID", "");
+      lcd.print(songName);
+      Serial.println("Now playing: " + songName);
     }
-    entry.close();
-  }
-}
+    // Wait for the button to be released
+    delay(1000);
+    while (digitalRead(CONFIRM_BUTTON) == LOW) {}
 
-
-
-
-
-
-
-
-
-
-
-
-// Strike keys for a certain amount of time
-void strikeKey(int key) {
-  digitalWrite(solenoids[key], HIGH);
-  digitalWrite(leds[key], LOW);
-  solenoidOnTimes[key] = millis();
-  solenoidStates[key] = true;
-}
-
-void turnOffKey(int key) {
-  digitalWrite(solenoids[key], LOW);
-  digitalWrite(leds[key], HIGH);
-  solenoidStates[key] = false;
-}
-
-void checkSolenoids() {
-  for (uint8_t i = 0; i < 16; i++) {
-    if (solenoidStates[i] && (millis() - solenoidOnTimes[i] > solenoidOnDurations[i])) {
-      turnOffKey(i);
+    attachInterrupt(digitalPinToInterrupt(CONFIRM_BUTTON), stopSong, FALLING);
+    while (SMF.isEOF() == false && SMF.isPaused() == false) {
+      // Play the MIDI file
+      SMF.getNextEvent();
     }
-  }
+    detachInterrupt(digitalPinToInterrupt(CONFIRM_BUTTON));
+    Serial.println("Song ended.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Song ended.");
+    refreshMenu = true;
+    SMF.close();
+    SMF.pause(false);
+    SMF.looping(false);
+    // Wait for the button to be released
+    delay(1000);
+    while (digitalRead(CONFIRM_BUTTON) == LOW) {}
 }
+
+
+
+void stopSong() {
+  refreshMenu = true;
+  SMF.pause(true);
+  Serial.println("Interrupted.");
+}
+
+
+
+
+
+
+
