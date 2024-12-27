@@ -28,9 +28,9 @@ IntervalTimer solenoidTimer;
 #define YellowLED 15
 #define BlueLED 14
 
-#define UP_BUTTON 21
+#define UP_BUTTON 29
 #define DOWN_BUTTON 20
-#define CONFIRM_BUTTON 29
+#define CONFIRM_BUTTON 21
 
 // LCD
 LiquidCrystal_I2C lcd(0x27, 16, 2);
